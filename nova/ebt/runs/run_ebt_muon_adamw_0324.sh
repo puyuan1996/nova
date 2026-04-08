@@ -75,53 +75,37 @@ NO_MCMC_DETACH=false
 # 均保持代码默认值,不在命令行覆盖
 
 ################################################################################
-# Batch 配置 - 针对 d26 模型优化
+# Batch 配置与训练步数自动计算 - 针对 d26 模型优化
 ################################################################################
 
-# DEVICE_BATCH_SIZE=8
-# GRAD_ACCUM=16
-# CONTEXT_LENGTH=256
-# NUM_GPUS=4
-
+# 1. 硬件与 Batch 基础配置
+NUM_GPUS=8
 DEVICE_BATCH_SIZE=4
 GRAD_ACCUM=8
 CONTEXT_LENGTH=512
-NUM_GPUS=4
 
-# NUM_GPUS=8
-
-# DEVICE_BATCH_SIZE=1
-# GRAD_ACCUM=64
-# CONTEXT_LENGTH=2048
-# NUM_GPUS=8
-
+# 2. 计算每步的有效 Token 数 (Tokens per step)
 EFFECTIVE_BATCH_SIZE=$((NUM_GPUS * DEVICE_BATCH_SIZE * GRAD_ACCUM * CONTEXT_LENGTH))
-# 当前配置: 4 × 4 × 8 × 512 = 65,536 tokens/step
+# 当前配置: 8 × 4 × 8 × 512 = 131,072 tokens/step
 
-################################################################################
-# 训练步数计算 (对齐 NanoChat d26 的 token 总量)
-################################################################################
-#
+# 3. 设置目标总 Token 数
 # NanoChat d26 (speedrun.sh --depth=26):
 #   tokens/step = 16 × 2048 × 4(accum) × 8(GPUs) = 1,048,576
 #   7000 step × 1,048,576 = 7,340,032,000 ≈ 7.34B tokens → bpb=0.747
-#
-# EBT 当前配置:
-#   tokens/step = 4 × 512 × 8(accum) × 4(GPUs) = 65,536
-#   对齐 7.34B tokens: 7,340,032,000 / 65,536 ≈ 112,000 步
-#
-# 注意: NanoChat 的 batch size 大 16x (1M vs 65K),
+TARGET_TOTAL_TOKENS=7340032000 # 约 7.34B tokens
+
+# 注意: 由于EBT训练时显存消耗更多，目前 NanoChat 的 batch size 更大 ,
 # 大 batch 梯度噪声更低, 每步更新更有效,
 # 所以即使 token 总量相同, EBT 可能需要更多步才能达到同等效果
 
-################################################################################
-# 训练步数计算 (对齐 NanoChat d26 的 token 总量)
-################################################################################
-TARGET_TOTAL_TOKENS=7340032000 # 约 7.34B tokens
-
-# 自适应计算 MAX_STEPS
+# 4. 自动计算总 Steps 数 (向下取整)
 MAX_STEPS=$(( TARGET_TOTAL_TOKENS / EFFECTIVE_BATCH_SIZE ))
 MAX_SCHEDULING_STEPS=$MAX_STEPS
+
+echo "自动计算的训练步数信息："
+echo "  - 每步有效 Token 数: ${EFFECTIVE_BATCH_SIZE}"
+echo "  - 目标总 Token 数:   ${TARGET_TOTAL_TOKENS}"
+echo "  - 计算得出总 Steps:  ${MAX_STEPS}"
 
 ################################################################################
 # 学习率配置 (基于模型规模推荐)
@@ -232,11 +216,13 @@ OPTION_FLAGS="--dynamic_wd --linear_warmdown --warmup_ratio 0.0 --warmdown_ratio
 # EBT 使用 autograd.grad 进行 MCMC 更新,与 fullgraph 模式不兼容
 # 推荐: transformer_only 模式,仅编译 transformer 部分
 
-# 暂时禁用,确保稳定性优先
-COMPILE_FLAGS=""
-
-# 稳定后可尝试启用
+# 目前这个会报错
 # COMPILE_FLAGS="--compile_model --compile_mode transformer_only"
+
+# 不使用 compile，steps 较少时适用
+# COMPILE_FLAGS="--compile_model --compile_mode disabled" 
+# 启用 compile，steps 较多时适用
+COMPILE_FLAGS="--compile_model --compile_mode full"
 
 ################################################################################
 # WandB 配置 (训练参数)
