@@ -296,6 +296,17 @@ def parse_args():
 
     parser.add_argument("--rl_loss_type", type=str, default="energy_gspo",
                         choices=["energy_gspo", "energy_reinforce", "token_logprobs"])
+    parser.add_argument(
+        "--logp_mcmc_grad",
+        type=str,
+        default="full",
+        choices=["none", "full"],
+        help=(
+            "For rl_loss_type=token_logprobs only: 'full' backprops through "
+            "EBT MCMC learning-mode logprobs; 'none' uses forward-only logprobs "
+            "as a stability ablation."
+        ),
+    )
     parser.add_argument("--advantage_norm", type=str, default="group_mean_global_std")
     parser.add_argument("--global_std_min", type=float, default=0.1)
     parser.add_argument("--skip_degenerate_threshold", type=float, default=0.9)
@@ -452,6 +463,7 @@ def main():
         seed=args.seed,
         sft_checkpoint_path=args.sft_checkpoint,
         rl_loss_type=args.rl_loss_type,
+        use_learning_mode_for_logprobs=(args.logp_mcmc_grad == "full"),
         advantage_norm=args.advantage_norm,
         global_std_min=args.global_std_min,
         skip_degenerate_threshold=args.skip_degenerate_threshold,

@@ -90,6 +90,7 @@ ENERGY_KL_MODE="${ENERGY_KL_MODE:-symmetric_huber}"
 ENERGY_KL_HUBER_DELTA="${ENERGY_KL_HUBER_DELTA:-0.5}"
 LEARNING_RATE="${LEARNING_RATE:-7e-7}"       # sparse reward + EBM energy drift: start lower than Sudoku
 # Set RL_LOSS_TYPE=energy_gspo GSPO_UPDATE_EPOCHS=2 to reuse each rollout.
+LOGP_MCMC_GRAD="${LOGP_MCMC_GRAD:-full}"    # token_logprobs only: full trains through EBT MCMC; none is safer ablation
 
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"
 GRADIENT_CLIP_VAL="${GRADIENT_CLIP_VAL:-0.5}"
@@ -206,6 +207,7 @@ exp_save_hparams "${EXP_SFT_DIR}" \
     "min_reward_std_to_update=${MIN_REWARD_STD_TO_UPDATE}" \
     "min_unique_completion_ratio_to_update=${MIN_UNIQUE_COMPLETION_RATIO_TO_UPDATE}" \
     "rl_loss_type=${RL_LOSS_TYPE}" \
+    "logp_mcmc_grad=${LOGP_MCMC_GRAD}" \
     "max_steps=${MAX_STEPS}" \
     "num_gpus=${NUM_GPUS}" \
     "save_top_k=${SAVE_TOP_K}"
@@ -324,6 +326,7 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} \
     --energy_kl_huber_delta ${ENERGY_KL_HUBER_DELTA} \
     --learning_rate ${LEARNING_RATE} \
     --rl_loss_type ${RL_LOSS_TYPE} \
+    --logp_mcmc_grad ${LOGP_MCMC_GRAD} \
     --weight_decay ${WEIGHT_DECAY} \
     --gradient_clip_val ${GRADIENT_CLIP_VAL} \
     --max_grad_per_param ${MAX_GRAD_PER_PARAM} \

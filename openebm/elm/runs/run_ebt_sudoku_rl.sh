@@ -74,6 +74,7 @@ ENERGY_KL_HUBER_DELTA="${ENERGY_KL_HUBER_DELTA:-0.5}"
 LEARNING_RATE="${LEARNING_RATE:-5e-7}"       # AdamW base/fallback LR; Muon matrices use MUON_LR
 # RL_LOSS_TYPE="energy_reinforce"  # removes 1/|y| dilution
 RL_LOSS_TYPE="${RL_LOSS_TYPE:-energy_gspo}"
+LOGP_MCMC_GRAD="${LOGP_MCMC_GRAD:-full}"    # token_logprobs only: full trains through EBT MCMC; none is safer ablation
 
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"
 GRADIENT_CLIP_VAL="${GRADIENT_CLIP_VAL:-0.5}"
@@ -205,6 +206,7 @@ exp_save_hparams "${EXP_SFT_DIR}" \
     "min_unique_completion_ratio_to_update=${MIN_UNIQUE_COMPLETION_RATIO_TO_UPDATE}" \
     "skip_consensus=${SKIP_CONSENSUS}" \
     "rl_loss_type=${RL_LOSS_TYPE}" \
+    "logp_mcmc_grad=${LOGP_MCMC_GRAD}" \
     "top_p=${TOP_P}" \
     "generation_batch_size=${GENERATION_BATCH_SIZE}" \
     "traj_output_dir=${TRAJ_OUTPUT_DIR}" \
@@ -334,6 +336,7 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} \
     --energy_kl_huber_delta ${ENERGY_KL_HUBER_DELTA} \
     --learning_rate ${LEARNING_RATE} \
     --rl_loss_type ${RL_LOSS_TYPE} \
+    --logp_mcmc_grad ${LOGP_MCMC_GRAD} \
     --weight_decay ${WEIGHT_DECAY} \
     --gradient_clip_val ${GRADIENT_CLIP_VAL} \
     --max_grad_per_param ${MAX_GRAD_PER_PARAM} \

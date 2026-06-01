@@ -1132,7 +1132,14 @@ class EBMGRPOTrainer(LightningModule):
         }
 
     def _loss_token_logprobs(self, gen_data, iteration):
-        """Token-level logprobs ratio (legacy). Known to produce NaN with EBT."""
+        """Token-level PPO/GRPO loss for ablations.
+
+        This path is closer to standard autoregressive PPO than energy_gspo
+        because the importance ratio is built from token log-probabilities.
+        With EBT, however, learning=True backpropagates through MCMC's
+        ``autograd.grad(..., create_graph=True)`` path. Keep detailed stability
+        logs and use very small smoke runs before long training.
+        """
         full_ids = gen_data["full_ids"]
         prompt_len = gen_data["prompt_len"]
         completion_masks = gen_data["completion_masks"].float()
@@ -1147,7 +1154,28 @@ class EBMGRPOTrainer(LightningModule):
         )
         current_logps = current_logps[:, :comp_len] * completion_masks
 
-        # Cross-rank NaN sync
+        valid_tokens = completion_masks.sum().clamp(min=1.0)
+
+        def masked_mean(x):
+            return ((x * completion_masks).sum() / valid_tokens)
+
+        def masked_max_abs(x):
+            masked = x.detach().abs() * completion_masks
+            return masked.max().item() if masked.numel() else 0.0
+
+        def finite_min_max(x):
+            vals = x.detach()[completion_masks.bool()]
+            if vals.numel() == 0:
+                return 0.0, 0.0
+            finite = vals[torch.isfinite(vals)]
+            if finite.numel() == 0:
+                return float("nan"), float("nan")
+            return finite.min().item(), finite.max().item()
+
+        current_nonfinite = (~torch.isfinite(current_logps)).float()
+        old_nonfinite = (~torch.isfinite(old_logps)).float()
+
+        # Cross-rank NaN/Inf sync before ratio exp.
         import torch.distributed as dist
         local_bad = torch.tensor(
             1.0 if (
@@ -1163,28 +1191,141 @@ class EBMGRPOTrainer(LightningModule):
                 (p * 0.0).sum() for p in self.model.parameters() if p.requires_grad
             )
             self.log("stability/skipped_step", 1.0)
-            return placeholder, {"policy_loss": 0.0, "kl": 0.0, "clip_ratio": 0.0}
+            self.log("stability/token_logp_nonfinite", 1.0)
+            self.log("train/token_logp_current_nonfinite_frac", masked_mean(current_nonfinite).item())
+            self.log("train/token_logp_old_nonfinite_frac", masked_mean(old_nonfinite).item())
+            return placeholder, {
+                "policy_loss": 0.0,
+                "kl": 0.0,
+                "clip_ratio": 0.0,
+                "token_logp_nonfinite": 1.0,
+            }
         self.log("stability/skipped_step", 0.0)
+        self.log("stability/token_logp_nonfinite", 0.0)
 
-        ratio = torch.exp(current_logps - old_logps)
+        log_ratio_raw = (current_logps - old_logps) * completion_masks
+        log_ratio = log_ratio_raw.clamp(min=-20.0, max=10.0) * completion_masks
+        log_ratio_clamp_frac = (
+            (((log_ratio_raw < -20.0) | (log_ratio_raw > 10.0)).float() * completion_masks).sum()
+            / valid_tokens
+        )
+        ratio = torch.exp(log_ratio) * completion_masks
         clipped_ratio = torch.clamp(ratio, 1.0 - self.config.epsilon, 1.0 + self.config.epsilon)
         per_token_loss1 = ratio * advantages.unsqueeze(1)
         per_token_loss2 = clipped_ratio * advantages.unsqueeze(1)
-        per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+        policy_loss_tokens = -torch.min(per_token_loss1, per_token_loss2)
+        policy_loss_only = (policy_loss_tokens * completion_masks).sum() / valid_tokens
+        per_token_loss = policy_loss_tokens
 
         kl_value = 0.0
+        kl_weighted_value = 0.0
         if ref_logps is not None and self.config.beta > 0.0:
             kl_diff = (ref_logps - current_logps).clamp(-10.0, 10.0)
             per_token_kl = torch.exp(kl_diff) - kl_diff - 1.0
             per_token_kl = per_token_kl * completion_masks
             per_token_loss = per_token_loss + self.config.beta * per_token_kl
-            kl_value = (per_token_kl.sum() / completion_masks.sum().clamp(min=1.0)).item()
+            kl_value = (per_token_kl.sum() / valid_tokens).item()
+            kl_weighted_value = self.config.beta * kl_value
 
-        loss = (per_token_loss * completion_masks).sum() / completion_masks.sum().clamp(min=1.0)
+        loss = (per_token_loss * completion_masks).sum() / valid_tokens
         is_clipped = (per_token_loss1 < per_token_loss2).float()
-        clip_ratio = (is_clipped * completion_masks).sum() / completion_masks.sum().clamp(min=1.0)
+        clip_ratio = (is_clipped * completion_masks).sum() / valid_tokens
 
-        return loss, {"policy_loss": loss.item(), "kl": kl_value, "clip_ratio": clip_ratio.item()}
+        ratio_det = ratio.detach()
+        log_ratio_det = log_ratio_raw.detach()
+        current_min, current_max = finite_min_max(current_logps)
+        old_min, old_max = finite_min_max(old_logps)
+        approx_kl_k1 = masked_mean(-log_ratio_raw).detach().item()
+        approx_kl_k3 = masked_mean((ratio_det - 1.0) - log_ratio_raw.detach()).item()
+        ratio_mean = masked_mean(ratio_det).item()
+        ratio_std = torch.sqrt(
+            masked_mean((ratio_det - ratio_mean).pow(2)).clamp(min=0.0)
+        ).item()
+        ratio_max = (ratio_det * completion_masks).max().item()
+        ratio_min_vals = ratio_det[completion_masks.bool()]
+        ratio_min = ratio_min_vals.min().item() if ratio_min_vals.numel() else 0.0
+        log_ratio_mean = masked_mean(log_ratio_raw.detach()).item()
+        log_ratio_std = torch.sqrt(
+            masked_mean((log_ratio_raw.detach() - log_ratio_mean).pow(2)).clamp(min=0.0)
+        ).item()
+        log_ratio_abs_max = masked_max_abs(log_ratio_raw)
+
+        loss_bad = torch.tensor(
+            1.0 if (
+                not torch.isfinite(loss)
+                or not torch.isfinite(ratio).all()
+                or not torch.isfinite(per_token_loss).all()
+            ) else 0.0,
+            device=self.device,
+        )
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(loss_bad, op=dist.ReduceOp.MAX)
+        if loss_bad.item() > 0.5:
+            placeholder = sum(
+                (p * 0.0).sum() for p in self.model.parameters() if p.requires_grad
+            )
+            self.log("stability/skipped_step", 1.0)
+            self.log("stability/token_logp_nonfinite", 1.0)
+            return placeholder, {
+                "policy_loss": 0.0,
+                "kl": kl_value,
+                "clip_ratio": clip_ratio.detach().item(),
+                "token_logp_nonfinite": 1.0,
+                "token_logp_log_ratio_abs_max": log_ratio_abs_max,
+            }
+
+        self.log("train/token_logp_loss", loss.detach().item())
+        self.log("train/token_logp_policy_loss", policy_loss_only.detach().item())
+        self.log("train/token_logp_kl_raw", kl_value)
+        self.log("train/token_logp_kl_term", kl_weighted_value)
+        self.log("train/token_logp_ratio_mean", ratio_mean)
+        self.log("train/token_logp_ratio_std", ratio_std)
+        self.log("train/token_logp_ratio_min", ratio_min)
+        self.log("train/token_logp_ratio_max", ratio_max)
+        self.log("train/token_logp_log_ratio_mean", log_ratio_mean)
+        self.log("train/token_logp_log_ratio_std", log_ratio_std)
+        self.log("train/token_logp_log_ratio_abs_max", log_ratio_abs_max)
+        self.log("train/token_logp_log_ratio_clamp_frac", log_ratio_clamp_frac.detach().item())
+        self.log("train/token_logp_clip_frac", clip_ratio.detach().item())
+        self.log("train/token_logp_approx_kl_k1", approx_kl_k1)
+        self.log("train/token_logp_approx_kl_k3", approx_kl_k3)
+        self.log("train/token_logp_current_min", current_min)
+        self.log("train/token_logp_current_max", current_max)
+        self.log("train/token_logp_old_min", old_min)
+        self.log("train/token_logp_old_max", old_max)
+        self.log("train/token_logp_mcmc_grad_full", float(learning_for_current))
+
+        if self.global_step % self.config.log_interval == 0 and self._is_rank0():
+            print(
+                f"[GRPO-TOKEN] step={self.global_step} "
+                f"loss={loss.detach().item():+.6f} "
+                f"ratio={ratio_mean:.4f}±{ratio_std:.4f} "
+                f"ratio_range=[{ratio_min:.4f},{ratio_max:.4f}] "
+                f"logr_abs_max={log_ratio_abs_max:.4f} "
+                f"clip={clip_ratio.detach().item():.3f} "
+                f"kl={kl_value:.6f} "
+                f"k3={approx_kl_k3:.6e} "
+                f"logp_cur=[{current_min:.2f},{current_max:.2f}] "
+                f"mcmc_grad={'full' if learning_for_current else 'none'}",
+                flush=True,
+            )
+
+        return loss, {
+            "policy_loss": policy_loss_only.detach().item(),
+            "total_loss": loss.detach().item(),
+            "kl": kl_value,
+            "kl_term": kl_weighted_value,
+            "clip_ratio": clip_ratio.item(),
+            "token_logp_ratio_mean": ratio_mean,
+            "token_logp_ratio_std": ratio_std,
+            "token_logp_ratio_min": ratio_min,
+            "token_logp_ratio_max": ratio_max,
+            "token_logp_log_ratio_abs_max": log_ratio_abs_max,
+            "token_logp_log_ratio_clamp_frac": log_ratio_clamp_frac.detach().item(),
+            "token_logp_approx_kl_k1": approx_kl_k1,
+            "token_logp_approx_kl_k3": approx_kl_k3,
+            "token_logp_nonfinite": 0.0,
+        }
 
     # ══════════════════════════════════════════════════════════════════════════
     # Validation

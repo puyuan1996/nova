@@ -23,7 +23,14 @@ export MODEL_SIZE="d26"
 # PRETRAIN_CKPT="/mnt/shared-storage-user/luyudong/nova-sft/nova/logs/ebt_runs/d26-ctx2048-20260422/sft_train/checkpoints/s=step=2984-d26-ctx2048-lr5e-05-bs1x32-muon_adamw-valid_loss=valid_loss=1.5680.ckpt"
 
 # after sft_train c2048
-PRETRAIN_CKPT="/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/ebt_runs/d26-ctx2048-20260426/sft_train.v4/checkpoints/s=step=562-d26-ctx2048-lr5e-05-bs1x32-muon_adamw-valid_loss=valid_loss=1.2264.ckpt"
+# PRETRAIN_CKPT="/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/ebt_runs/d26-ctx2048-20260426/sft_train.v4/checkpoints/s=step=562-d26-ctx2048-lr5e-05-bs1x32-muon_adamw-valid_loss=valid_loss=1.2264.ckpt"
+
+
+# base train 需要sft-train
+# PRETRAIN_CKPT="/mnt/shared-storage-user/luyudong/nova/logs/checkpoints/s2-step1-learnablealpha-init300-freeembed-direct-2node-8gpu-bf16mixed_0605_1441_d26_ctx2048_bs512_lr0.0012_2nodes_8gpus/s=step=6999-d26-ctx2048-lr0.0012-bs1x32-muon_adamw-valid_loss=valid_loss=2.5051.ckpt"
+
+PRETRAIN_CKPT="/mnt/shared-storage-user/luyudong/nova-sft/nova/logs/ebt_runs/d26-ctx2048-20260522-s2-fixedalpha397/sft_train/checkpoints/s=step=1703-d26-ctx2048-lr0.00024-bs1x32-muon_adamw-valid_loss=valid_loss=0.6867.ckpt"
+
 
 ### 环境变量 ###
 HOME="/mnt/shared-storage-user/puyuan/code/nanochat"
@@ -44,13 +51,17 @@ export SUDOKU_DATA_DIR="${SUDOKU_DATA_DIR:-/mnt/shared-storage-user/puyuan/code/
 ################################################################################
 # EBT 核心超参数 (对齐预训练配置)
 ################################################################################
-MCMC_STEP_SIZE=500.0
-MCMC_STEP_SIZE_LR_MULTIPLIER=750
+# 该 checkpoint 的 hyper_parameters 中 FFN multiplier 为 2.67:
+# d26 dim=1664 -> int(1664 * 2.67)=4442。未设置时默认 FFN hidden=1664，
+# 会导致 feed_forward.w1/w2/w3 形状不匹配，checkpoint 覆盖率降到约 0.65。
+FFN_DIM_MULTIPLIER=2.67
+MCMC_STEP_SIZE=397.0
+MCMC_STEP_SIZE_LR_MULTIPLIER=5000
 MCMC_NUM_STEPS=2
 EBT_TYPE="time_embed"
 NORMALIZE_INITIAL_CONDITION=true
 DENOISING_INITIAL_CONDITION="random_noise"
-MCMC_STEP_SIZE_LEARNABLE=true
+MCMC_STEP_SIZE_LEARNABLE=false
 NO_MCMC_DETACH=false
 
 ################################################################################
@@ -108,8 +119,17 @@ OPTION_FLAGS="--dynamic_wd --linear_warmdown --warmup_ratio 0.05 --warmdown_rati
 ################################################################################
 # torch.compile 配置
 ################################################################################
-COMPILE_FLAGS="--compile_model --compile_mode full"
+# 对齐 checkpoint 保存布局: model.transformer._orig_mod.* + transformer_eager.*
+COMPILE_FLAGS="--compile_model --compile_mode transformer_only"
 WANDB_FLAGS=""
+
+MCMC_FLAGS=""
+if [ "${MCMC_STEP_SIZE_LEARNABLE}" = true ]; then
+    MCMC_FLAGS="${MCMC_FLAGS} --mcmc_step_size_learnable"
+fi
+if [ "${NO_MCMC_DETACH}" = true ]; then
+    MCMC_FLAGS="${MCMC_FLAGS} --no_mcmc_detach"
+fi
 
 ################################################################################
 # Checkpoint 管理配置
@@ -173,8 +193,11 @@ exp_save_hparams "${EXP_DIR}/sft_train" \
     "grad_accum=${GRAD_ACCUM}" \
     "num_gpus=${NUM_GPUS}" \
     "max_steps=${MAX_STEPS}" \
+    "ffn_dim_multiplier=${FFN_DIM_MULTIPLIER}" \
     "mcmc_step_size=${MCMC_STEP_SIZE}" \
     "mcmc_lr_multiplier=${MCMC_STEP_SIZE_LR_MULTIPLIER}" \
+    "mcmc_step_size_learnable=${MCMC_STEP_SIZE_LEARNABLE}" \
+    "compile_flags=${COMPILE_FLAGS}" \
     "pretrain_ckpt=${PRETRAIN_CKPT}" \
     "optimizer=muon_adamw" \
     "dataset=sudoku_sft"
@@ -191,6 +214,8 @@ echo "=================================="
 echo "Pretrain ckpt: ${PRETRAIN_CKPT}"
 echo "Dataset:       sudoku_sft"
 echo "Peak LR:       ${PEAK_LR}"
+echo "FFN mult:      ${FFN_DIM_MULTIPLIER}"
+echo "MCMC alpha:    ${MCMC_STEP_SIZE} (learnable=${MCMC_STEP_SIZE_LEARNABLE})"
 echo "Max steps:     ${MAX_STEPS}"
 echo "Log file:      ${LOG_FILE}"
 echo ""
@@ -250,10 +275,11 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyu
 --normalize_initial_condition \
 --ebt_type ${EBT_TYPE} \
 --denoising_initial_condition ${DENOISING_INITIAL_CONDITION} \
---mcmc_step_size_learnable \
 --mcmc_step_size ${MCMC_STEP_SIZE} \
 --mcmc_step_size_lr_multiplier ${MCMC_STEP_SIZE_LR_MULTIPLIER} \
 --mcmc_num_steps ${MCMC_NUM_STEPS} \
+--ffn_dim_multiplier ${FFN_DIM_MULTIPLIER} \
+${MCMC_FLAGS} \
 --context_length ${CONTEXT_LENGTH} \
 --gpus "-1" \
 --peak_learning_rate ${PEAK_LR} \
